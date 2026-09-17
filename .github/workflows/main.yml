@@ -1,0 +1,619 @@
+name: Build Quote Reader APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+
+      - name: Create App & Inject Code
+        run: |
+          flutter create quote_app --org com.quote.app
+          cd quote_app
+          flutter pub add gal file_picker fast_gbk sqflite path
+
+          # 使用 Python 安全配置 minSdk 与清单权限，避免字符转义损坏
+          python3 -c '
+          import os
+          # 1. 适配 minSdk
+          kts = "android/app/build.gradle.kts"
+          groovy = "android/app/build.gradle"
+          if os.path.exists(kts):
+              with open(kts, "r") as f: c = f.read()
+              c = c.replace("minSdk = flutter.minSdkVersion", "minSdk = 23")
+              with open(kts, "w") as f: f.write(c)
+          if os.path.exists(groovy):
+              with open(groovy, "r") as f: c = f.read()
+              c = c.replace("minSdkVersion flutter.minSdkVersion", "minSdkVersion 23")
+              with open(groovy, "w") as f: f.write(c)
+
+          # 2. 注入 AndroidManifest.xml 权限
+          manifest = "android/app/src/main/AndroidManifest.xml"
+          with open(manifest, "r") as f: mc = f.read()
+          perms = """
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29"/>
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+          """
+          mc = mc.replace("<application", perms + "\n    <application")
+          with open(manifest, "w") as f: f.write(mc)
+          '
+
+          # 写入完整应用代码
+          cat << 'EOF' > lib/main.dart
+          import 'dart:convert';
+          import 'dart:io';
+          import 'dart:typed_data';
+          import 'dart:ui' as ui;
+          import 'package:fast_gbk/fast_gbk.dart';
+          import 'package:file_picker/file_picker.dart';
+          import 'package:flutter/material.dart';
+          import 'package:flutter/rendering.dart';
+          import 'package:gal/gal.dart';
+          import 'package:path/path.dart' as p;
+          import 'package:sqflite/sqflite.dart';
+
+          void main() {
+            WidgetsFlutterBinding.ensureInitialized();
+            runApp(const QuoteReaderApp());
+          }
+
+          enum CardTemplateType { paperInk, minimalist, polaroid }
+
+          class QuoteData {
+            final String text;
+            final String bookTitle;
+            final String author;
+            final String? chapter;
+            final String? userNote;
+            final DateTime createTime;
+            QuoteData({required this.text, required this.bookTitle, required this.author, this.chapter, this.userNote, DateTime? createTime})
+                : createTime = createTime ?? DateTime.now();
+          }
+
+          class Chapter {
+            final String title;
+            final String content;
+            Chapter({required this.title, required this.content});
+          }
+
+          class Book {
+            final String title;
+            final String author;
+            final String filePath;
+            final List<Chapter> chapters;
+            Book({required this.title, required this.author, required this.filePath, required this.chapters});
+
+            static Future<Book> parseTxt(String path) async {
+              final file = File(path);
+              final bytes = await file.readAsBytes();
+              String fullText;
+              try {
+                fullText = utf8.decode(bytes);
+              } catch (_) {
+                fullText = gbk.decode(bytes);
+              }
+
+              String rawName = path.split(Platform.pathSeparator).last.replaceAll('.txt', '');
+              String title = rawName;
+              String author = '佚名';
+              if (rawName.contains('-')) {
+                final parts = rawName.split('-');
+                title = parts[0].trim();
+                author = parts[1].trim();
+              }
+
+              final chapterRegex = RegExp(r'(^\s*第[0-9一二三四五六七八九十百千]+[章回卷节部篇].*?$)', multiLine: true);
+              final matches = chapterRegex.allMatches(fullText).toList();
+              List<Chapter> chapters = [];
+
+              if (matches.isEmpty) {
+                chapters.add(Chapter(title: '正文', content: fullText.trim()));
+              } else {
+                if (matches.first.start > 0) {
+                  final intro = fullText.substring(0, matches.first.start).trim();
+                  if (intro.isNotEmpty) chapters.add(Chapter(title: '序言', content: intro));
+                }
+                for (int i = 0; i < matches.length; i++) {
+                  final cur = matches[i];
+                  final cTitle = cur.group(0)!.trim();
+                  final end = (i + 1 < matches.length) ? matches[i + 1].start : fullText.length;
+                  chapters.add(Chapter(title: cTitle, content: fullText.substring(cur.end, end).trim()));
+                }
+              }
+              return Book(title: title, author: author, filePath: path, chapters: chapters);
+            }
+          }
+
+          class BookProgress {
+            final String filePath;
+            final String title;
+            final String author;
+            final int totalChapters;
+            final int lastChapterIndex;
+            final double lastScrollOffset;
+            final DateTime updatedAt;
+            BookProgress({required this.filePath, required this.title, required this.author, required this.totalChapters, required this.lastChapterIndex, required this.lastScrollOffset, required this.updatedAt});
+            Map<String, dynamic> toMap() => {'file_path': filePath, 'title': title, 'author': author, 'total_chapters': totalChapters, 'last_chapter_index': lastChapterIndex, 'last_scroll_offset': lastScrollOffset, 'updated_at': updatedAt.millisecondsSinceEpoch};
+            factory BookProgress.fromMap(Map<String, dynamic> m) => BookProgress(filePath: m['file_path'], title: m['title'], author: m['author'], totalChapters: m['total_chapters'], lastChapterIndex: m['last_chapter_index'], lastScrollOffset: (m['last_scroll_offset'] as num).toDouble(), updatedAt: DateTime.fromMillisecondsSinceEpoch(m['updated_at']));
+            int get percent => totalChapters <= 0 ? 0 : (((lastChapterIndex + 1) / totalChapters) * 100).clamp(1, 100).toInt();
+          }
+
+          class SavedQuote {
+            final int? id;
+            final String text;
+            final String bookTitle;
+            final String author;
+            final String? chapter;
+            final String? userNote;
+            final DateTime createdAt;
+            SavedQuote({this.id, required this.text, required this.bookTitle, required this.author, this.chapter, this.userNote, required this.createdAt});
+            Map<String, dynamic> toMap() => {'id': id, 'text': text, 'book_title': bookTitle, 'author': author, 'chapter': chapter, 'user_note': userNote, 'created_at': createdAt.millisecondsSinceEpoch};
+            factory SavedQuote.fromMap(Map<String, dynamic> m) => SavedQuote(id: m['id'], text: m['text'], bookTitle: m['book_title'], author: m['author'], chapter: m['chapter'], userNote: m['user_note'], createdAt: DateTime.fromMillisecondsSinceEpoch(m['created_at']));
+          }
+
+          class DBHelper {
+            static Database? _db;
+            static Future<Database> get database async => _db ??= await _init();
+            static Future<Database> _init() async {
+              final dbPath = await getDatabasesPath();
+              return openDatabase(p.join(dbPath, 'quote.db'), version: 1, onCreate: (db, v) async {
+                await db.execute('CREATE TABLE book_history (id INTEGER PRIMARY KEY AUTOINCREMENT, file_path TEXT UNIQUE, title TEXT, author TEXT, total_chapters INTEGER, last_chapter_index INTEGER, last_scroll_offset REAL, updated_at INTEGER)');
+                await db.execute('CREATE TABLE saved_quotes (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, book_title TEXT, author TEXT, chapter TEXT, user_note TEXT, created_at INTEGER)');
+              });
+            }
+            static Future<void> saveProgress(BookProgress p) async => (await database).insert('book_history', p.toMap(), conflictAlgorithm: ConflictAlgorithm.replace);
+            static Future<List<BookProgress>> getHistory() async => ((await database).query('book_history', orderBy: 'updated_at DESC')).then((l) => l.map((e) => BookProgress.fromMap(e)).toList());
+            static Future<void> deleteBook(String path) async => (await database).delete('book_history', where: 'file_path = ?', whereArgs: [path]);
+            static Future<void> insertQuote(SavedQuote q) async => (await database).insert('saved_quotes', q.toMap());
+            static Future<List<SavedQuote>> getQuotes() async => ((await database).query('saved_quotes', orderBy: 'created_at DESC')).then((l) => l.map((e) => SavedQuote.fromMap(e)).toList());
+            static Future<void> deleteQuote(int id) async => (await database).delete('saved_quotes', where: 'id = ?', whereArgs: [id]);
+          }
+
+          class QuoteReaderApp extends StatelessWidget {
+            const QuoteReaderApp({super.key});
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: '书摘工坊',
+                  debugShowCheckedModeBanner: false,
+                  theme: ThemeData(useMaterial3: true, scaffoldBackgroundColor: const Color(0xFFF9F7F3)),
+                  home: const MainNavigationScreen(),
+                );
+          }
+
+          class MainNavigationScreen extends StatefulWidget {
+            const MainNavigationScreen({super.key});
+            @override
+            State<MainNavigationScreen> createState() => _MainNavigationScreenState();
+          }
+
+          class _MainNavigationScreenState extends State<MainNavigationScreen> {
+            int _cur = 0;
+            final _gKey = GlobalKey<_GalleryScreenState>();
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: IndexedStack(index: _cur, children: [const BookshelfScreen(), GalleryScreen(key: _gKey)]),
+                bottomNavigationBar: NavigationBar(
+                  selectedIndex: _cur,
+                  backgroundColor: const Color(0xFFF7F5F0),
+                  indicatorColor: const Color(0xFFE8E2D5),
+                  onDestinationSelected: (i) {
+                    setState(() => _cur = i);
+                    if (i == 1) _gKey.currentState?.reload();
+                  },
+                  destinations: const [
+                    NavigationDestination(icon: Icon(Icons.auto_stories_outlined), selectedIcon: Icon(Icons.auto_stories), label: '书架'),
+                    NavigationDestination(icon: Icon(Icons.collections_bookmark_outlined), selectedIcon: Icon(Icons.collections_bookmark), label: '画廊'),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class BookshelfScreen extends StatefulWidget {
+            const BookshelfScreen({super.key});
+            @override
+            State<BookshelfScreen> createState() => _BookshelfScreenState();
+          }
+
+          class _BookshelfScreenState extends State<BookshelfScreen> {
+            List<BookProgress> _list = [];
+            bool _loading = false;
+            @override
+            void initState() {
+              super.initState();
+              _load();
+            }
+            Future<void> _load() async {
+              final res = await DBHelper.getHistory();
+              setState(() => _list = res);
+            }
+            Future<void> _import() async {
+              try {
+                final r = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['txt']);
+                if (r != null && r.files.single.path != null) {
+                  setState(() => _loading = true);
+                  final b = await Book.parseTxt(r.files.single.path!);
+                  await DBHelper.saveProgress(BookProgress(filePath: b.filePath, title: b.title, author: b.author, totalChapters: b.chapters.length, lastChapterIndex: 0, lastScrollOffset: 0, updatedAt: DateTime.now()));
+                  await _load();
+                  setState(() => _loading = false);
+                  if (mounted) _open(b, 0, 0);
+                }
+              } catch (e) {
+                setState(() => _loading = false);
+              }
+            }
+            void _open(Book b, int ch, double off) {
+              Navigator.of(context).push(MaterialPageRoute(builder: (_) => ReaderScreen(book: b, initialChapter: ch, initialOffset: off))).then((_) => _load());
+            }
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('我的书架', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)), backgroundColor: Colors.transparent, elevation: 0),
+                body: _loading
+                    ? const Center(child: CircularProgressIndicator(color: Color(0xFFB84A39)))
+                    : _list.isEmpty
+                        ? const Center(child: Text('书架空空如也\n点击右下角导入 TXT', textAlign: TextAlign.center, style: TextStyle(color: Colors.grey)))
+                        : ListView.separated(
+                            padding: const EdgeInsets.all(16),
+                            itemCount: _list.length,
+                            separatorBuilder: (_, __) => const SizedBox(height: 10),
+                            itemBuilder: (c, i) {
+                              final item = _list[i];
+                              return Dismissible(
+                                key: Key(item.filePath),
+                                onDismissed: (_) async {
+                                  await DBHelper.deleteBook(item.filePath);
+                                  _load();
+                                },
+                                child: Card(
+                                  elevation: 0,
+                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: const BorderSide(color: Color(0xFFEBE6DC))),
+                                  child: ListTile(
+                                    leading: const Icon(Icons.book, color: Color(0xFF2C2A28), size: 36),
+                                    title: Text(item.title, maxLines: 1, overflow: TextOverflow.ellipsis),
+                                    subtitle: Text('${item.author} · 进度 ${item.percent}%'),
+                                    onTap: () async {
+                                      final b = await Book.parseTxt(item.filePath);
+                                      _open(b, item.lastChapterIndex, item.lastScrollOffset);
+                                    },
+                                  ),
+                                ),
+                              );
+                            },
+                          ),
+                floatingActionButton: FloatingActionButton(
+                  backgroundColor: const Color(0xFF2C2A28),
+                  onPressed: _import,
+                  child: const Icon(Icons.add, color: Colors.white),
+                ),
+              );
+            }
+          }
+
+          class ReaderScreen extends StatefulWidget {
+            final Book book;
+            final int initialChapter;
+            final double initialOffset;
+            const ReaderScreen({super.key, required this.book, this.initialChapter = 0, this.initialOffset = 0});
+            @override
+            State<ReaderScreen> createState() => _ReaderScreenState();
+          }
+
+          class _ReaderScreenState extends State<ReaderScreen> {
+            late int _ch;
+            final _sc = ScrollController();
+            bool _dark = false;
+            @override
+            void initState() {
+              super.initState();
+              _ch = widget.initialChapter.clamp(0, widget.book.chapters.length - 1);
+              if (widget.initialOffset > 0) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (_sc.hasClients) _sc.jumpTo(widget.initialOffset);
+                });
+              }
+            }
+            @override
+            void dispose() {
+              _save();
+              _sc.dispose();
+              super.dispose();
+            }
+            void _save() {
+              final off = _sc.hasClients ? _sc.offset : 0.0;
+              DBHelper.saveProgress(BookProgress(filePath: widget.book.filePath, title: widget.book.title, author: widget.book.author, totalChapters: widget.book.chapters.length, lastChapterIndex: _ch, lastScrollOffset: off, updatedAt: DateTime.now()));
+            }
+            @override
+            Widget build(BuildContext context) {
+              final cur = widget.book.chapters[_ch];
+              final bg = _dark ? const Color(0xFF141416) : const Color(0xFFF7F5F0);
+              final fg = _dark ? const Color(0xFFD1D1D6) : const Color(0xFF2C2A28);
+              return PopScope(
+                canPop: true,
+                onPopInvokedWithResult: (d, _) {
+                  if (d) _save();
+                },
+                child: Scaffold(
+                  backgroundColor: bg,
+                  appBar: AppBar(
+                    title: Text(widget.book.title, style: TextStyle(color: fg, fontSize: 16)),
+                    backgroundColor: Colors.transparent,
+                    elevation: 0,
+                    iconTheme: IconThemeData(color: fg),
+                    actions: [
+                      IconButton(icon: Icon(_dark ? Icons.wb_sunny : Icons.nightlight), onPressed: () => setState(() => _dark = !_dark)),
+                    ],
+                  ),
+                  body: Column(
+                    children: [
+                      Expanded(
+                        child: SingleChildScrollView(
+                          controller: _sc,
+                          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(cur.title, style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: fg)),
+                              const SizedBox(height: 16),
+                              SelectableText(
+                                cur.content,
+                                style: TextStyle(fontSize: 16, height: 1.85, color: fg),
+                                contextMenuBuilder: (ctx, st) {
+                                  final items = st.contextMenuButtonItems;
+                                  items.insert(
+                                    0,
+                                    ContextMenuButtonItem(
+                                      label: '✦ 制作书摘',
+                                      onPressed: () {
+                                        final txt = st.textEditingValue.selection.textInside(st.textEditingValue.text).trim();
+                                        st.hideToolbar();
+                                        if (txt.isNotEmpty) {
+                                          Navigator.of(context).push(MaterialPageRoute(
+                                            builder: (_) => QuoteWorkshopScreen(
+                                              initialQuote: QuoteData(text: txt, bookTitle: widget.book.title, author: widget.book.author, chapter: cur.title),
+                                            ),
+                                          ));
+                                        }
+                                      },
+                                    ),
+                                  );
+                                  return AdaptiveTextSelectionToolbar.buttonItems(anchors: st.contextMenuAnchors, buttonItems: items);
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                        child: Row(
+                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                          children: [
+                            TextButton(onPressed: _ch > 0 ? () => setState(() { _ch--; _sc.jumpTo(0); _save(); }) : null, child: Text('上一章', style: TextStyle(color: fg))),
+                            Text('${_ch + 1} / ${widget.book.chapters.length}', style: TextStyle(color: fg.withOpacity(0.5))),
+                            TextButton(onPressed: _ch < widget.book.chapters.length - 1 ? () => setState(() { _ch++; _sc.jumpTo(0); _save(); }) : null, child: Text('下一章', style: TextStyle(color: fg))),
+                          ],
+                        ),
+                      )
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+
+          class QuoteWorkshopScreen extends StatefulWidget {
+            final QuoteData initialQuote;
+            const QuoteWorkshopScreen({super.key, required this.initialQuote});
+            @override
+            State<QuoteWorkshopScreen> createState() => _QuoteWorkshopScreenState();
+          }
+
+          class _QuoteWorkshopScreenState extends State<QuoteWorkshopScreen> {
+            final GlobalKey _cardKey = GlobalKey();
+            CardTemplateType _tmpl = CardTemplateType.paperInk;
+            double _fs = 15.0;
+            final _noteCtrl = TextEditingController();
+            bool _saving = false;
+
+            Future<void> _export() async {
+              setState(() => _saving = true);
+              try {
+                await Future.delayed(const Duration(milliseconds: 50));
+                final b = _cardKey.currentContext?.findRenderObject() as RenderRepaintBoundary?;
+                if (b != null) {
+                  final img = await b.toImage(pixelRatio: 3.0);
+                  final byteData = await img.toByteData(format: ui.ImageByteFormat.png);
+                  final png = byteData!.buffer.asUint8List();
+                  if (!await Gal.hasAccess()) await Gal.requestAccess();
+                  await Gal.putImageBytes(png, name: 'quote_${DateTime.now().millisecondsSinceEpoch}.png');
+                }
+                await DBHelper.insertQuote(SavedQuote(
+                  text: widget.initialQuote.text,
+                  bookTitle: widget.initialQuote.bookTitle,
+                  author: widget.initialQuote.author,
+                  chapter: widget.initialQuote.chapter,
+                  userNote: _noteCtrl.text.isEmpty ? null : _noteCtrl.text,
+                  createdAt: DateTime.now(),
+                ));
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('✨ 保存相册成功，已归档入画廊！')));
+              } catch (e) {
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('保存出错: $e')));
+              } finally {
+                if (mounted) setState(() => _saving = false);
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                backgroundColor: const Color(0xFF18181B),
+                appBar: AppBar(
+                  backgroundColor: Colors.transparent,
+                  title: const Text('书摘工坊', style: TextStyle(color: Colors.white, fontSize: 16)),
+                  actions: [
+                    TextButton(onPressed: _saving ? null : _export, child: Text(_saving ? '保存中' : '保存卡片', style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold))),
+                  ],
+                ),
+                body: Column(
+                  children: [
+                    Expanded(
+                      child: Center(
+                        child: SingleChildScrollView(
+                          child: RepaintBoundary(
+                            key: _cardKey,
+                            child: _buildCard(),
+                          ),
+                        ),
+                      ),
+                    ),
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      color: const Color(0xFF27272A),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                            children: [
+                              _btn('纸墨古雅', CardTemplateType.paperInk),
+                              _btn('现代极简', CardTemplateType.minimalist),
+                              _btn('胶片拍立得', CardTemplateType.polaroid),
+                            ],
+                          ),
+                          Slider(value: _fs, min: 13, max: 22, onChanged: (v) => setState(() => _fs = v)),
+                          TextField(
+                            controller: _noteCtrl,
+                            style: const TextStyle(color: Colors.white, fontSize: 13),
+                            decoration: const InputDecoration(hintText: '写下一句批注/感悟...', hintStyle: TextStyle(color: Colors.white38)),
+                            onChanged: (_) => setState(() {}),
+                          )
+                        ],
+                      ),
+                    )
+                  ],
+                ),
+              );
+            }
+
+            Widget _btn(String t, CardTemplateType type) {
+              final sel = _tmpl == type;
+              return GestureDetector(
+                onTap: () => setState(() => _tmpl = type),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
+                  decoration: BoxDecoration(color: sel ? Colors.white : Colors.transparent, borderRadius: BorderRadius.circular(16), border: Border.all(color: Colors.white24)),
+                  child: Text(t, style: TextStyle(color: sel ? Colors.black : Colors.white, fontSize: 12)),
+                ),
+              );
+            }
+
+            Widget _buildCard() {
+              final isPaper = _tmpl == CardTemplateType.paperInk;
+              final isDark = _tmpl == CardTemplateType.minimalist;
+              final bg = isPaper ? const Color(0xFFF6F3EC) : isDark ? const Color(0xFF141416) : const Color(0xFFFCFCFD);
+              final tc = isPaper ? const Color(0xFF2B2824) : isDark ? const Color(0xFFF4F4F5) : const Color(0xFF222426);
+
+              return Container(
+                width: 320,
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(color: bg, borderRadius: BorderRadius.circular(12), boxShadow: const [BoxShadow(color: Colors.black12, blurRadius: 16)]),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('“', style: TextStyle(fontSize: 32, height: 0.8, color: isPaper ? const Color(0xFFB84A39) : Colors.grey)),
+                    const SizedBox(height: 8),
+                    Text(widget.initialQuote.text, style: TextStyle(fontSize: _fs, height: 1.8, color: tc)),
+                    if (_noteCtrl.text.isNotEmpty) ...[
+                      const SizedBox(height: 12),
+                      Text('// ${_noteCtrl.text}', style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: Colors.grey)),
+                    ],
+                    const SizedBox(height: 20),
+                    Text('— ${widget.initialQuote.author}《${widget.initialQuote.bookTitle}》', style: TextStyle(fontSize: 11, color: isDark ? Colors.white38 : Colors.black45)),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class GalleryScreen extends StatefulWidget {
+            const GalleryScreen({super.key});
+            @override
+            State<GalleryScreen> createState() => _GalleryScreenState();
+          }
+
+          class _GalleryScreenState extends State<GalleryScreen> {
+            List<SavedQuote> _q = [];
+            @override
+            void initState() {
+              super.initState();
+              reload();
+            }
+            Future<void> reload() async {
+              final r = await DBHelper.getQuotes();
+              setState(() => _q = r);
+            }
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('书摘画廊', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)), backgroundColor: Colors.transparent, elevation: 0),
+                body: _q.isEmpty
+                    ? const Center(child: Text('画廊里还没有卡片\n长按选中文本即可制作'))
+                    : ListView.builder(
+                        padding: const EdgeInsets.all(16),
+                        itemCount: _q.length,
+                        itemBuilder: (c, i) {
+                          final item = _q[i];
+                          return Dismissible(
+                            key: Key('${item.id}'),
+                            onDismissed: (_) => DBHelper.deleteQuote(item.id!),
+                            child: Card(
+                              margin: const EdgeInsets.only(bottom: 12),
+                              color: Colors.white,
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: const BorderSide(color: Color(0xFFEBE6DC))),
+                              child: Padding(
+                                padding: const EdgeInsets.all(16),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(item.text, maxLines: 3, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 14, height: 1.6)),
+                                    const SizedBox(height: 8),
+                                    Text('— ${item.author}《${item.bookTitle}》', style: const TextStyle(fontSize: 11, color: Colors.grey)),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build Debug APK
+        run: |
+          cd quote_app
+          flutter build apk --debug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: quote-reader-apk
+          path: quote_app/build/app/outputs/flutter-apk/app-debug.apk
